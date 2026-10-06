@@ -17,7 +17,7 @@ void main() {
       expect(frame.sum('value'), equals(10.0));
       expect(frame.sum('count'), equals(100));
 
-      final filtered = frame.filterContains('name', 'alpha');
+      final filtered = frame.filter((c) => c('name').contains('alpha'));
       expect(filtered.length, equals(2));
       expect(filtered['name'].toList(), equals(['alpha', 'alphabet']));
       expect(filtered.sum('count'), equals(40));
@@ -30,7 +30,7 @@ void main() {
         'decimal': [1.25, 8.5, 3.75, 9.0],
       }, chunkSize: 2);
 
-      final filtered = frame.filterContains('label', 'hit');
+      final filtered = frame.filter((c) => c('label').contains('hit'));
 
       expect(filtered['label'].toList(), ['hit-one', 'hit-two', 'hit-three']);
       expect(filtered.toSeries('integer'), isA<IntSeries>());
@@ -52,8 +52,8 @@ void main() {
       }, chunkSize: 2);
 
       final view = frame
-          .filterViewContains('label', 'hit')
-          .filterContains('label', '-b');
+          .view((c) => c('label').contains('hit'))
+          .filter((c) => c('label').contains('-b'));
 
       expect(view.length, 1);
       expect(view['value'].toList(), [4]);
@@ -93,13 +93,10 @@ void main() {
       frame.deleteRow(1);
 
       expect(frame.sum('value'), equals(11));
-      final matchMask = frame.contains('label', 'a');
-      expect(
-        [for (var i = 0; i < matchMask.length; i++) matchMask[i]],
-        equals([0, 0, 1]),
-      );
-      expect(
-          frame.filterContains('label', 'b')['value'].toList(), equals([2, 4]));
+      final matchMask = frame.mask((c) => c('label').contains('a'));
+      expect(matchMask.toList(), equals([false, false, true]));
+      expect(frame.filter((c) => c('label').contains('b'))['value'].toList(),
+          equals([2, 4]));
     });
 
     test('caches numeric aggregates across appends, deletes, and compaction',
@@ -249,17 +246,18 @@ void main() {
         {'id': 5, 'name': 'omega'},
       ]);
 
-      final mask = frame.match('name', RegExp(r'^(a|g|d)'));
+      Condition startsWithAgd(Columns c) =>
+          c('name').contains(RegExp(r'^(a|g|d)'));
       expect(
-        [for (var i = 0; i < mask.length; i++) mask[i]],
-        equals([1, 1, 1, 0]),
+        frame.mask(startsWithAgd).toList(),
+        equals([true, true, true, false]),
       );
       expect(
-        frame.filter(mask).rowAt(2),
+        frame.filter(startsWithAgd).rowAt(2),
         equals({'id': 4, 'name': 'delta'}),
       );
       expect(
-        frame.filterMatch('name', RegExp(r'^o')).rowAt(0),
+        frame.filter((c) => c('name').contains(RegExp(r'^o'))).rowAt(0),
         equals({'id': 5, 'name': 'omega'}),
       );
     });
@@ -271,7 +269,7 @@ void main() {
       });
 
       expect(
-        () => frame.filter(IntTensor.fromList([1])),
+        () => frame.filter((c) => c('missing').eq(1)),
         throwsArgumentError,
       );
       expect(
@@ -283,7 +281,10 @@ void main() {
       );
       expect(() => frame.sum('name'), throwsArgumentError);
       expect(() => frame.sum('unknown'), throwsArgumentError);
-      expect(() => frame.contains('id', '1'), throwsArgumentError);
+      expect(
+        () => frame.filter((c) => c('id').contains('1')),
+        throwsArgumentError,
+      );
     });
 
     test('empty filtered frames do not cache non-numeric columns as sums', () {
@@ -292,7 +293,7 @@ void main() {
         'name': ['alpha', 'beta'],
       });
 
-      final empty = frame.filterContains('name', 'missing');
+      final empty = frame.filter((c) => c('name').contains('missing'));
 
       expect(empty.length, isZero);
       expect(empty.sum('id'), equals(0));

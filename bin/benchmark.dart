@@ -606,7 +606,7 @@ void _benchmarkDataFrame(
   final cachedFrame = DataFrame.fromColumns({'value': values});
 
   IntTensor? listMask;
-  IntTensor? frameMask;
+  Bitset? frameMask;
   final (listMaskStats, frameMaskStats) = benchmarkPair(
     () {
       final mask = IntTensor.vector(rowCount);
@@ -615,7 +615,7 @@ void _benchmarkDataFrame(
       }
       listMask = mask;
     },
-    () => frameMask = frame.contains('label', pattern),
+    () => frameMask = frame.mask((c) => c('label').contains(pattern)),
     trials: trials,
   );
 
@@ -662,11 +662,11 @@ void _benchmarkDataFrame(
             Map<String, Object?>.from(row),
       ];
     },
-    () => frameFiltered = frame.filterContains('label', pattern),
+    () => frameFiltered = frame.filter((c) => c('label').contains(pattern)),
     trials: trials,
   );
   final viewFilterStats = benchmark(
-    () => frameView = frame.filterViewContains('label', pattern),
+    () => frameView = frame.view((c) => c('label').contains(pattern)),
     trials: trials,
   );
   List<String>? columnFilteredLabels;
@@ -683,7 +683,7 @@ void _benchmarkDataFrame(
       columnFilteredLabels = selectedLabels;
       columnFilteredValues = selectedValues;
     },
-    () => frameFiltered = frame.filterContains('label', pattern),
+    () => frameFiltered = frame.filter((c) => c('label').contains(pattern)),
     trials: trials,
   );
 
@@ -691,7 +691,7 @@ void _benchmarkDataFrame(
     throw StateError('DataFrame contains benchmark produced no result');
   }
   for (int row = 0; row < rowCount; row++) {
-    if (listMask![row] != frameMask![row]) {
+    if ((listMask![row] == 1) != frameMask![row]) {
       throw StateError('DataFrame contains result mismatch at row $row');
     }
   }

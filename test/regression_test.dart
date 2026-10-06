@@ -142,15 +142,28 @@ void main() {
         'name': ['alpha', null, 'beta', 'alphabet'],
         'id': [1, 2, 3, 4],
       });
-      expect(_ints(frame.contains('name', 'alpha')), equals([1, 0, 0, 1]));
-      expect(_ints(frame.match('name', RegExp('^b'))), equals([0, 0, 1, 0]));
-      expect(frame.filterContains('name', 'alpha').sum('id'), equals(5));
-      expect(frame.filterViewContains('name', 'alpha').sum('id'), equals(5));
       expect(
-        frame.filterViewContains('name', 'a').filterContains('name', 'bet'),
+        frame.mask((c) => c('name').contains('alpha')).toList(),
+        equals([true, false, false, true]),
+      );
+      expect(
+        frame.mask((c) => c('name').contains(RegExp('^b'))).toList(),
+        equals([false, false, true, false]),
+      );
+      expect(frame.filter((c) => c('name').contains('alpha')).sum('id'),
+          equals(5));
+      expect(
+          frame.view((c) => c('name').contains('alpha')).sum('id'), equals(5));
+      expect(
+        frame
+            .view((c) => c('name').contains('a'))
+            .filter((c) => c('name').contains('bet')),
         hasLength(2),
       );
-      expect(() => frame.contains('id', '1'), throwsArgumentError);
+      expect(
+        () => frame.mask((c) => c('id').contains('1')),
+        throwsArgumentError,
+      );
     });
 
     test('filtered stats include every selected chunk', () {
@@ -159,7 +172,7 @@ void main() {
         'value': [1, 2, 3, 4],
       }, chunkSize: 2);
       frame.appendRow({'tag': 'a', 'value': 5000000000});
-      final filtered = frame.filterContains('tag', 'a');
+      final filtered = frame.filter((c) => c('tag').contains('a'));
       expect(filtered.sum('value'), equals(5000000010));
       expect(filtered.max('value'), equals(5000000000));
     });
@@ -177,7 +190,7 @@ void main() {
       expect(frame['label'].toList(), equals(['a', 'c', 'd', 'e', 'f']));
       expect(frame['value'].toList(), equals([1, 3, 4, 5, 6]));
       expect(frame.sum('score'), closeTo(16.5, 1e-9));
-      expect(frame.contains('label', 'f').sum(), equals(1));
+      expect(frame.mask((c) => c('label').contains('f')).count, equals(1));
     });
   });
 }

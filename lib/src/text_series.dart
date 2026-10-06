@@ -1,5 +1,7 @@
 import 'dart:convert';
 import 'dart:typed_data';
+
+import 'bitset.dart';
 import 'int_tensor.dart';
 
 /// text series; utf8 + int32 offsets
@@ -65,6 +67,51 @@ class TextSeries {
     final indices = <int>[];
     _scanContains(Uint8List.fromList(utf8.encode(pattern)), indices.add);
     return indices;
+  }
+
+  /// Sets [out] for every row that contains [pattern].
+  void markContains(String pattern, Bitset out) =>
+      _scanContains(Uint8List.fromList(utf8.encode(pattern)), out.set);
+
+  /// Sets [out] for every row that starts with [prefix].
+  void markStartsWith(String prefix, Bitset out) {
+    final bytes = utf8.encode(prefix);
+    for (var row = 0; row < length; row++) {
+      final start = _offsets[row];
+      if (_offsets[row + 1] - start >= bytes.length && _bytesAt(start, bytes)) {
+        out.set(row);
+      }
+    }
+  }
+
+  /// Sets [out] for every row that ends with [suffix].
+  void markEndsWith(String suffix, Bitset out) {
+    final bytes = utf8.encode(suffix);
+    for (var row = 0; row < length; row++) {
+      final end = _offsets[row + 1];
+      if (end - _offsets[row] >= bytes.length &&
+          _bytesAt(end - bytes.length, bytes)) {
+        out.set(row);
+      }
+    }
+  }
+
+  /// Sets [out] for every row equal to [value].
+  void markEquals(String value, Bitset out) {
+    final bytes = utf8.encode(value);
+    for (var row = 0; row < length; row++) {
+      final start = _offsets[row];
+      if (_offsets[row + 1] - start == bytes.length && _bytesAt(start, bytes)) {
+        out.set(row);
+      }
+    }
+  }
+
+  bool _bytesAt(int position, Uint8List bytes) {
+    for (var i = 0; i < bytes.length; i++) {
+      if (_bytes[position + i] != bytes[i]) return false;
+    }
+    return true;
   }
 
   void _scanContains(Uint8List patternBytes, void Function(int) onMatch) {

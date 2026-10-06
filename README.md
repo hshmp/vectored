@@ -7,8 +7,10 @@ most of it, and you don't need Python or a server to use it.
 
 - **Fast:** filtering, searching and totals are much quicker than plain Dart
   lists, and quicker than Pandas in early tests.
-- **Familiar:** `sum`, `mean`, `filter` and `concat` work the way they do in
-  Pandas.
+- **Familiar:** `sum`, `mean`, `filter`, `groupBy` and `concat` work the way
+  they do in Pandas.
+- **Easy to write:** filters are plain Dart, so your editor autocompletes
+  them and catches typos before you run anything.
 - **Built for live data:** add and remove rows freely, and totals update
   instantly instead of being recalculated.
 - **Pure Dart:** runs anywhere Dart runs, including Flutter apps, with nothing
@@ -21,9 +23,11 @@ most of it, and you don't need Python or a server to use it.
 | Language | Dart | Dart | Python | Python / Rust |
 | Tables with named columns | ✅ | ❌ | ✅ | ✅ |
 | Text search and filtering | ✅ | ❌ | ✅ | ✅ |
+| Group by | ✅ | ❌ | ✅ | ✅ |
+| Missing values | ✅ | ❌ | ✅ | ✅ |
 | Instant totals while editing | ✅ | ❌ | ❌ | ❌ |
 | Runs inside a Flutter app | ✅ | ✅ | ❌ | ❌ |
-| Group by, joins, CSV import | Planned | ❌ | ✅ | ✅ |
+| Joins, CSV import | Planned | ❌ | ✅ | ✅ |
 
 Pick Vectored when your data lives in a Dart or Flutter app. For heavy
 analysis on a desktop or server, Polars is still the fastest option.
@@ -64,15 +68,62 @@ people.min('age');
 people.max('age');
 ```
 
-## Searching and filtering
+## Filtering
+
+Describe the rows you want, and type `c('column').` to see every option.
 
 ```dart
-people.filterContains('name', 'a');         // rows whose name contains "a"
-people.filterMatch('name', RegExp(r'^b'));  // rows whose name starts with "b"
+final withA = people.filter((c) => c('name').contains('a'));
+withA['name'].toList(); // [ada, barbara]
+
+final over30B = people.filter((c) => c('age').gt(30) & c('name').startsWith('b'));
+over30B['name'].toList(); // [barbara]
 ```
 
-Use `filterViewContains` instead when you only need to read the results. It
-skips copying, so it's faster.
+`contains` takes plain text or a `RegExp`, so you can switch between them
+without changing your code:
+
+```dart
+final Pattern search = RegExp(r'^l'); // or just 'l'
+people.filter((c) => c('name').contains(search))['name'].toList(); // [linus]
+```
+
+Combine conditions with `&` (and), `|` (or) and `~` (not). Use `view` instead
+of `filter` when you only need to read the results. It skips copying, so it's
+faster.
+
+```dart
+people.view((c) => c('age').gt(30)).sum('age'); // 88
+```
+
+## Grouping
+
+```dart
+final staff = DataFrame.fromColumns({
+  'team': ['web', 'app', 'web', 'app', 'web'],
+  'salary': [70, 80, 90, 60, 50],
+});
+
+final byTeam = staff.groupBy(['team']).agg((g) => [g.count(), g.mean('salary')]);
+byTeam.rowAt(0); // {team: web, count: 3, salary_mean: 70.0}
+```
+
+`g.` offers `count`, `sum`, `mean`, `min`, `max`, `first` and `last`.
+
+## Missing values and yes/no columns
+
+Leave a value as `null` when it's unknown. Totals and averages skip it.
+
+```dart
+final tasks = DataFrame.fromColumns({
+  'done': [true, false, null],
+  'hours': [2, null, 5],
+});
+
+tasks.mean('hours'); // 3.5
+tasks.filter((c) => c('done').isTrue).length; // 1
+tasks.filter((c) => c('hours').isNull).length; // 1
+```
 
 ## Stacking tables
 

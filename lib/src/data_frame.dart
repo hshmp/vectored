@@ -1,7 +1,11 @@
 import 'dart:collection';
+import 'dart:typed_data';
 
-import 'int_tensor.dart';
+import 'bitset.dart';
 import 'series.dart';
+
+part 'condition.dart';
+part 'group_by.dart';
 
 /// A mutable, chunked collection of named [Series] columns.
 ///
@@ -15,8 +19,9 @@ class DataFrame {
     for (final column in _columns) column: <Object?>[],
   };
   int _pendingLength = 0;
-  final Set<({int segment, int row})> _deletedRows;
-  final Map<int, int> _deletedCountsBySegment;
+  // deleted rows per segment id; absent when a segment has none
+  final Map<int, Bitset> _deleted;
+  int _deletedCount;
   final Map<String, _NumericStats> _numericStats;
   final Set<String> _uncacheableColumns;
   final Set<String> _nonNumericColumns;
@@ -29,13 +34,13 @@ class DataFrame {
     this._columns,
     this._chunkSize,
     this._chunks,
-    this._deletedRows,
-    this._deletedCountsBySegment,
+    this._deleted,
     this._numericStats,
     this._uncacheableColumns,
     this._nonNumericColumns,
     this._aggregateCaching,
-  );
+  ) : _deletedCount =
+            _deleted.values.fold(0, (total, rows) => total + rows.count);
 
   /// Creates an empty frame with the named [columns].
   factory DataFrame.empty(
@@ -48,7 +53,6 @@ class DataFrame {
       List.unmodifiable(columns),
       chunkSize,
       [],
-      <({int segment, int row})>{},
       {},
       {},
       {},
@@ -103,7 +107,6 @@ class DataFrame {
       List.unmodifiable(names),
       chunkSize,
       [],
-      <({int segment, int row})>{},
       {},
       {},
       names.toSet(),
@@ -125,7 +128,7 @@ class DataFrame {
   }
 
   /// The number of rows that have not been deleted.
-  int get length => _physicalLength - _deletedRows.length;
+  int get length => _physicalLength - _deletedCount;
 
   /// The declared column names in insertion order.
   List<String> get columns => _columns;
@@ -152,14 +155,14 @@ class DataFrame {
     final chunk = _chunks[location.chunk];
     return Map.unmodifiable({
       for (final column in _columns)
-        column: chunk.columns[column]![location.row],
+        column: chunk.columns[column]!.valueAt(location.row),
     });
   }
 
   Object? _valueAt(String column, int index) {
     _flushPending();
     final location = _locationAt(index);
-    return _chunks[location.chunk].columns[column]![location.row];
+    return _chunks[location.chunk].columns[column]!.valueAt(location.row);
   }
 
   /// Returns a materialized [Series] containing this column's live values.
@@ -200,14 +203,10 @@ class DataFrame {
     _flushPending();
     final location = _locationForDelete(index);
     final chunk = _chunks[location.chunk];
-    _deletedRows.add((segment: chunk.id, row: location.row));
-    _deletedCountsBySegment.update(
-      chunk.id,
-      (count) => count + 1,
-      ifAbsent: () => 1,
-    );
+    (_deleted[chunk.id] ??= Bitset(chunk.length)).set(location.row);
+    _deletedCount++;
     for (final column in _columns) {
-      final value = chunk.columns[column]![location.row];
+      final value = chunk.columns[column]!.valueAt(location.row);
       final stats = _numericStats[column];
       if (value is! num || stats == null) continue;
 
@@ -219,163 +218,94 @@ class DataFrame {
     _visibleRows = null;
   }
 
-  /// Returns a mask of live rows whose string [column] contains [pattern].
+  /// Returns one flag per live row: set where [where] selects the row.
   ///
-  /// Uses the packed [StringSeries] matcher on each chunk and omits deleted
-  /// rows. Null values never match.
-  IntTensor contains(String column, String pattern) => _stringMask(
-        column,
-        (values) => values.containingIndices(pattern),
-        (text) => text.contains(pattern),
-      );
-
-  /// Returns a mask of live rows matching [pattern] in [column].
-  ///
-  /// Null values never match.
-  IntTensor match(String column, RegExp pattern) => _stringMask(
-        column,
-        (values) => values.matchingIndices(pattern),
-        pattern.hasMatch,
-      );
-
-  IntTensor _stringMask(
-    String column,
-    List<int> Function(StringSeries) matcher,
-    bool Function(String) rowTest,
-  ) {
-    _requireColumn(column);
-    _flushPending();
-    final output = IntTensor.vector(length);
+  /// ```dart
+  /// final adults = frame.mask((c) => c('age').gte(18));
+  /// adults.count; // how many rows matched
+  /// ```
+  Bitset mask(Where where) {
+    final condition = _prepare(where);
+    final output = Bitset(length);
     var logicalRow = 0;
-
     for (final chunk in _chunks) {
-      final hits = _matchingRows(chunk, column, matcher, rowTest);
-      var next = 0;
-      for (var row = 0; row < chunk.length; row++) {
-        if (_deletedRows.contains((segment: chunk.id, row: row))) continue;
-        while (next < hits.length && hits[next] < row) {
-          next++;
+      final selected = condition._evaluate(chunk);
+      final deleted = _deleted[chunk.id];
+      if (deleted == null) {
+        for (final row in selected.toIndices()) {
+          output.set(logicalRow + row);
         }
-        if (next < hits.length && hits[next] == row) output[logicalRow] = 1;
+        logicalRow += chunk.length;
+        continue;
+      }
+      for (var row = 0; row < chunk.length; row++) {
+        if (deleted[row]) continue;
+        if (selected[row]) output.set(logicalRow);
         logicalRow++;
       }
     }
     return output;
   }
 
-  /// Returns the ascending rows of [chunk] whose string [column] matches.
+  /// Returns a new frame with only the rows selected by [where].
   ///
-  /// Packed string chunks use [matcher]; chunks holding strings and nulls
-  /// (stored as [ObjectSeries]) test each string with [rowTest].
-  static List<int> _matchingRows(
-    _FrameSegment chunk,
-    String column,
-    List<int> Function(StringSeries) matcher,
-    bool Function(String) rowTest,
-  ) {
-    final values = chunk.columns[column];
-    if (values is StringSeries) return matcher(values);
-    if (values is ObjectSeries &&
-        values.data.every((value) => value == null || value is String)) {
-      return [
-        for (var row = 0; row < values.length; row++)
-          if (values[row] case final String text when rowTest(text)) row,
-      ];
-    }
-    throw ArgumentError.value(
-        column, 'column', 'Column is not a string series');
-  }
-
-  /// Returns a new frame containing rows selected by [mask].
-  ///
-  /// [mask] must have one entry per live row; nonzero entries are selected.
-  DataFrame filter(IntTensor mask) {
-    _flushPending();
-    if (mask.length != length) {
-      throw ArgumentError.value(mask.length, 'mask', 'Mask length mismatch');
-    }
-
+  /// ```dart
+  /// frame.filter((c) => c('name').contains('lin'));
+  /// frame.filter((c) => c('name').contains(RegExp(r'^a')) | c('age').gt(60));
+  /// ```
+  DataFrame filter(Where where) {
+    final condition = _prepare(where);
     final selectedChunks = <_FrameSegment>[];
-    var logicalRow = 0;
     for (final chunk in _chunks) {
-      final selectedRows = <int>[];
-      for (var row = 0; row < chunk.length; row++) {
-        if (_deletedRows.contains((segment: chunk.id, row: row))) continue;
-        if (mask[logicalRow++] != 0) selectedRows.add(row);
-      }
-      _appendSelectedChunk(chunk, selectedRows, selectedChunks);
+      _appendSelectedChunk(
+        chunk,
+        _liveRows(condition, chunk).toIndices(),
+        selectedChunks,
+      );
     }
     return _fromSelectedChunks(selectedChunks);
   }
 
-  /// Returns a new frame containing rows where [column] contains [pattern].
-  DataFrame filterContains(String column, String pattern) => _filterString(
-        column,
-        (values) => values.containingIndices(pattern),
-        (text) => text.contains(pattern),
-      );
-
-  /// Returns a new frame containing rows where [pattern] matches [column].
-  DataFrame filterMatch(String column, RegExp pattern) => _filterString(
-        column,
-        (values) => values.matchingIndices(pattern),
-        pattern.hasMatch,
-      );
-
-  /// Returns a snapshot view of rows whose [column] contains [pattern].
+  /// Returns a lightweight view of the rows selected by [where].
   ///
-  /// The view stores source segment and row indices; it does not materialize
-  /// columns or allocate a row mask.
-  DataFrameView filterViewContains(String column, String pattern) =>
-      _filterView(
-        column,
-        (values) => values.containingIndices(pattern),
-        (text) => text.contains(pattern),
-      );
-
-  /// Returns a snapshot view of rows matching [pattern] in [column].
-  DataFrameView filterViewMatch(String column, RegExp pattern) => _filterView(
-        column,
-        (values) => values.matchingIndices(pattern),
-        pattern.hasMatch,
-      );
-
-  DataFrameView _filterView(
-    String column,
-    List<int> Function(StringSeries) matcher,
-    bool Function(String) rowTest,
-  ) {
-    _requireColumn(column);
-    _flushPending();
+  /// Nothing is copied: the view points at this frame's rows, which makes it
+  /// faster than [filter] when you only need to read or total the results.
+  DataFrameView view(Where where) {
+    final condition = _prepare(where);
     final rows = <_RowPointer>[];
     for (final chunk in _chunks) {
-      for (final row in _matchingRows(chunk, column, matcher, rowTest)) {
-        if (!_deletedRows.contains((segment: chunk.id, row: row))) {
-          rows.add(_RowPointer(chunk, row));
-        }
+      for (final row in _liveRows(condition, chunk).toIndices()) {
+        rows.add(_RowPointer(chunk, row));
       }
     }
     return DataFrameView._(this, rows);
   }
 
-  DataFrame _filterString(
-    String column,
-    List<int> Function(StringSeries) matcher,
-    bool Function(String) rowTest,
-  ) {
-    _requireColumn(column);
-    _flushPending();
-    final selectedChunks = <_FrameSegment>[];
-    for (final chunk in _chunks) {
-      final selectedRows = <int>[];
-      for (final row in _matchingRows(chunk, column, matcher, rowTest)) {
-        if (!_deletedRows.contains((segment: chunk.id, row: row))) {
-          selectedRows.add(row);
-        }
-      }
-      _appendSelectedChunk(chunk, selectedRows, selectedChunks);
+  /// Groups rows by the values of the [keys] columns.
+  ///
+  /// ```dart
+  /// frame.groupBy(['city']).agg((g) => [g.count(), g.mean('age')]);
+  /// ```
+  GroupBy groupBy(List<String> keys) {
+    if (keys.isEmpty) {
+      throw ArgumentError.value(keys, 'keys', 'Group by at least one column');
     }
-    return _fromSelectedChunks(selectedChunks);
+    keys.forEach(_requireColumn);
+    return GroupBy._(this, List.unmodifiable(keys));
+  }
+
+  Condition _prepare(Where where) {
+    _flushPending();
+    final condition = where(const Columns._());
+    condition._validate(this);
+    return condition;
+  }
+
+  /// Returns the live rows of [chunk] selected by [condition].
+  Bitset _liveRows(Condition condition, _FrameSegment chunk) {
+    final selected = condition._evaluate(chunk);
+    final deleted = _deleted[chunk.id];
+    return deleted == null ? selected : selected.andNot(deleted);
   }
 
   void _appendSelectedChunk(
@@ -426,7 +356,6 @@ class DataFrame {
       _columns,
       _chunkSize,
       chunks,
-      <({int segment, int row})>{},
       {},
       stats,
       uncacheable,
@@ -441,6 +370,7 @@ class DataFrame {
       IntSeries() => series.take(indices),
       FloatSeries() => series.take(indices),
       StringSeries() => series.take(indices),
+      BoolSeries() => series.take(indices),
       ObjectSeries() => series.take(indices),
     };
   }
@@ -467,9 +397,11 @@ class DataFrame {
       } else if (!hasDeletedRows && values is FloatSeries) {
         total += values.sum();
       } else {
+        final deleted = _deleted[chunk.id];
         for (var row = 0; row < chunk.length; row++) {
-          if (_deletedRows.contains((segment: chunk.id, row: row))) continue;
-          final value = values[row];
+          if (deleted != null && deleted[row]) continue;
+          final value = values.valueAt(row);
+          if (value == null) continue;
           if (value is! num) {
             throw ArgumentError.value(
                 column, 'column', 'Column is not numeric');
@@ -481,7 +413,7 @@ class DataFrame {
     return total;
   }
 
-  /// Returns the live value count for numeric [column].
+  /// Returns the number of live non-null values in numeric [column].
   ///
   /// Returns in O(1) for owned frames. Shared external series require a scan.
   int count(String column) => _numericStatsFor(column).count;
@@ -513,10 +445,8 @@ class DataFrame {
     if (!_sameSchema(other)) {
       throw ArgumentError('Frames must have the same column names');
     }
-    final (leftChunks, leftDeletes, leftDeleteCounts) =
-        _copySegmentsForConcat(this);
-    final (rightChunks, rightDeletes, rightDeleteCounts) =
-        _copySegmentsForConcat(other);
+    final (leftChunks, leftDeletes) = _copySegmentsForConcat(this);
+    final (rightChunks, rightDeletes) = _copySegmentsForConcat(other);
     final aggregateCaching = _aggregateCaching && other._aggregateCaching;
     final numericStats = <String, _NumericStats>{};
     if (aggregateCaching) {
@@ -538,7 +468,6 @@ class DataFrame {
       _chunkSize,
       [...leftChunks, ...rightChunks],
       {...leftDeletes, ...rightDeletes},
-      {...leftDeleteCounts, ...rightDeleteCounts},
       numericStats,
       {..._uncacheableColumns, ...other._uncacheableColumns},
       {..._nonNumericColumns, ...other._nonNumericColumns},
@@ -552,17 +481,18 @@ class DataFrame {
   /// deleted rows or many small chunks consume too much memory.
   void compact() {
     _flushPending();
-    if (_deletedRows.isEmpty && _chunks.length <= 1) return;
+    if (_deletedCount == 0 && _chunks.length <= 1) return;
 
     final values = [for (final _ in _columns) <Object?>[]];
     for (final chunk in _chunks) {
       final sourceColumns = [
         for (final column in _columns) chunk.columns[column]!,
       ];
+      final deleted = _deleted[chunk.id];
       for (var row = 0; row < chunk.length; row++) {
-        if (_deletedRows.contains((segment: chunk.id, row: row))) continue;
+        if (deleted != null && deleted[row]) continue;
         for (var index = 0; index < _columns.length; index++) {
-          values[index].add(sourceColumns[index][row]);
+          values[index].add(sourceColumns[index].valueAt(row));
         }
       }
     }
@@ -580,8 +510,8 @@ class DataFrame {
     _chunks
       ..clear()
       ..addAll(compacted._chunks);
-    _deletedRows.clear();
-    _deletedCountsBySegment.clear();
+    _deleted.clear();
+    _deletedCount = 0;
     _numericStats
       ..clear()
       ..addAll(compacted._numericStats);
@@ -645,16 +575,19 @@ class DataFrame {
   /// Returns whether every value in [series] is a number.
   static bool _isNumericSeries(Series<dynamic> series) => switch (series) {
         IntSeries() || FloatSeries() => true,
-        ObjectSeries(:final data) => data.every((value) => value is num),
-        StringSeries() => false,
+        ObjectSeries(:final data) =>
+          data.every((value) => value == null || value is num),
+        StringSeries() || BoolSeries() => false,
       };
 
-  /// Adds every stored value of numeric [series] to [stats].
+  /// Adds every non-null stored value of numeric [series] to [stats].
   ///
   /// Returns false when a value is not finite and cannot be cached.
   static bool _addSeriesToStats(_NumericStats stats, Series<dynamic> series) {
     for (var row = 0; row < series.length; row++) {
-      final value = _cacheableNumber(series[row]);
+      final raw = series.valueAt(row);
+      if (raw == null) continue;
+      final value = _cacheableNumber(raw);
       if (value == null) return false;
       stats.add(value);
     }
@@ -670,8 +603,9 @@ class DataFrame {
     final rows = <({int chunk, int row})>[];
     for (var chunkIndex = 0; chunkIndex < _chunks.length; chunkIndex++) {
       final chunk = _chunks[chunkIndex];
+      final deleted = _deleted[chunk.id];
       for (var rowIndex = 0; rowIndex < chunk.length; rowIndex++) {
-        if (!_deletedRows.contains((segment: chunk.id, row: rowIndex))) {
+        if (deleted == null || !deleted[rowIndex]) {
           rows.add((chunk: chunkIndex, row: rowIndex));
         }
       }
@@ -695,13 +629,14 @@ class DataFrame {
     var remaining = index;
     for (var chunkIndex = 0; chunkIndex < _chunks.length; chunkIndex++) {
       final chunk = _chunks[chunkIndex];
-      final liveCount = chunk.length - (_deletedCountsBySegment[chunk.id] ?? 0);
+      final deleted = _deleted[chunk.id];
+      final liveCount = chunk.length - (deleted?.count ?? 0);
       if (remaining >= liveCount) {
         remaining -= liveCount;
         continue;
       }
       for (var row = 0; row < chunk.length; row++) {
-        if (_deletedRows.contains((segment: chunk.id, row: row))) continue;
+        if (deleted != null && deleted[row]) continue;
         if (remaining-- == 0) return (chunk: chunkIndex, row: row);
       }
     }
@@ -719,9 +654,11 @@ class DataFrame {
     final stats = _NumericStats();
     for (final chunk in _chunks) {
       final values = chunk.columns[column]!;
+      final deleted = _deleted[chunk.id];
       for (var row = 0; row < chunk.length; row++) {
-        if (_deletedRows.contains((segment: chunk.id, row: row))) continue;
-        final value = values[row];
+        if (deleted != null && deleted[row]) continue;
+        final value = values.valueAt(row);
+        if (value == null) continue;
         if (value is! num) {
           throw ArgumentError.value(column, 'column', 'Column is not numeric');
         }
@@ -735,9 +672,11 @@ class DataFrame {
     final stats = _NumericStats(trackFrequencies: false);
     for (final segment in _chunks) {
       final values = segment.columns[column]!;
+      final deleted = _deleted[segment.id];
       for (var row = 0; row < segment.length; row++) {
-        if (_deletedRows.contains((segment: segment.id, row: row))) continue;
-        stats.add(values[row] as num);
+        if (deleted != null && deleted[row]) continue;
+        final value = values.valueAt(row);
+        if (value != null) stats.add(value as num);
       }
     }
     return stats;
@@ -763,9 +702,7 @@ class DataFrame {
     }
   }
 
-  bool _hasDeletedRows(_FrameSegment chunk) {
-    return (_deletedCountsBySegment[chunk.id] ?? 0) != 0;
-  }
+  bool _hasDeletedRows(_FrameSegment chunk) => _deleted.containsKey(chunk.id);
 
   bool _sameSchema(DataFrame other) =>
       _columns.length == other._columns.length &&
@@ -773,52 +710,50 @@ class DataFrame {
 
   static int _newSegmentId() => _nextRowId++;
 
-  static (List<_FrameSegment>, Set<({int segment, int row})>, Map<int, int>)
-      _copySegmentsForConcat(DataFrame frame) {
+  static (List<_FrameSegment>, Map<int, Bitset>) _copySegmentsForConcat(
+      DataFrame frame) {
     final newSegments = <_FrameSegment>[];
-    final segmentIds = <int, int>{};
+    final deletes = <int, Bitset>{};
     for (final segment in frame._chunks) {
       final newId = _newSegmentId();
-      segmentIds[segment.id] = newId;
       newSegments.add(_FrameSegment(segment.data, newId));
+      final deleted = frame._deleted[segment.id];
+      if (deleted != null) deletes[newId] = deleted.copy();
     }
-
-    final deletes = <({int segment, int row})>{};
-    final deleteCounts = <int, int>{};
-    for (final deletion in frame._deletedRows) {
-      final segmentId = segmentIds[deletion.segment]!;
-      deletes.add((
-        segment: segmentId,
-        row: deletion.row,
-      ));
-      deleteCounts.update(segmentId, (count) => count + 1, ifAbsent: () => 1);
-    }
-    return (newSegments, deletes, deleteCounts);
+    return (newSegments, deletes);
   }
 
   /// Picks the most compact series type that stores [values] without
-  /// silently changing them.
+  /// silently changing them; `null` entries become null flags.
   ///
   /// Ints outside int32 range, or ints too large for float32 in a mixed
-  /// numeric column, fall back to an exact [ObjectSeries].
+  /// numeric column, fall back to an exact [ObjectSeries], as do chunks that
+  /// are entirely `null`.
   static Series<dynamic> _seriesFromValues(String name, List<Object?> values) {
-    if (values.every((value) => value is int)) {
-      if (values.every((value) => _fitsInt32(value as int))) {
-        return Series.fromInts(name, values.cast<int>());
+    final present = values.where((value) => value != null);
+    if (values.isNotEmpty && present.isEmpty) {
+      return Series.fromObjects(name, values);
+    }
+    if (present.every((value) => value is int)) {
+      if (present.every((value) => _fitsInt32(value as int))) {
+        return Series.fromInts(name, values.cast<int?>());
       }
       return Series.fromObjects(name, values);
     }
-    if (values.every((value) => value is num)) {
-      if (values.any((value) => value is int && !_fitsFloat32(value))) {
+    if (present.every((value) => value is num)) {
+      if (present.any((value) => value is int && !_fitsFloat32(value))) {
         return Series.fromObjects(name, values);
       }
       return Series.fromFloats(
         name,
-        values.map((value) => (value as num).toDouble()).toList(),
+        [for (final value in values) (value as num?)?.toDouble()],
       );
     }
-    if (values.every((value) => value is String)) {
-      return Series.fromStrings(name, values.cast<String>());
+    if (present.every((value) => value is String)) {
+      return Series.fromStrings(name, values.cast<String?>());
+    }
+    if (present.every((value) => value is bool)) {
+      return Series.fromBools(name, values.cast<bool?>());
     }
     return Series.fromObjects(name, values);
   }
@@ -839,7 +774,7 @@ class DataFrame {
         if (values.isNotEmpty) continue;
         if (values is List<num>) {
           frame._numericStats[column] = _NumericStats();
-        } else if (values is List<String>) {
+        } else if (values is List<String> || values is List<bool>) {
           frame._nonNumericColumns.add(column);
           frame._uncacheableColumns.add(column);
         }
@@ -985,49 +920,45 @@ class DataFrameView extends IterableBase<Map<String, Object?>> {
     final pointer = _rows[index];
     return Map.unmodifiable({
       for (final column in columns)
-        column: pointer.segment.columns[column]![pointer.row],
+        column: pointer.segment.columns[column]!.valueAt(pointer.row),
     });
   }
 
-  /// Sums a numeric column directly through selected row pointers.
-  num sum(String column) {
+  /// Sums the non-null values of numeric [column] in the selected rows.
+  num sum(String column) => _numeric(column).$1;
+
+  /// Returns the mean of numeric [column], or `null` when it has no values.
+  double? mean(String column) {
+    final (total, count) = _numeric(column);
+    return count == 0 ? null : total / count;
+  }
+
+  (num, int) _numeric(String column) {
     _frame._requireColumn(column);
     num total = 0;
+    var count = 0;
     for (final pointer in _rows) {
-      final value = pointer.segment.columns[column]![pointer.row];
+      final value = pointer.segment.columns[column]!.valueAt(pointer.row);
+      if (value == null) continue;
       if (value is! num) {
         throw ArgumentError.value(column, 'column', 'Column is not numeric');
       }
       total += value;
+      count++;
     }
-    return total;
+    return (total, count);
   }
 
-  /// Returns the mean of numeric [column], or `null` when the view is empty.
-  double? mean(String column) {
-    _frame._requireColumn(column);
-    if (_rows.isEmpty) return null;
-    return sum(column) / _rows.length;
-  }
-
-  /// Filters this view without materializing columns or a mask.
-  ///
-  /// Null values never match.
-  DataFrameView filterContains(String column, String pattern) {
-    _frame._requireColumn(column);
-    final selected = <_RowPointer>[];
-    for (final pointer in _rows) {
-      final value = pointer.segment.columns[column]![pointer.row];
-      if (value != null && value is! String) {
-        throw ArgumentError.value(
-          column,
-          'column',
-          'Column is not a string series',
-        );
-      }
-      if (value?.contains(pattern) ?? false) selected.add(pointer);
-    }
-    return DataFrameView._(_frame, selected);
+  /// Narrows this view to the rows also selected by [where].
+  DataFrameView filter(Where where) {
+    final condition = where(const Columns._()).._validate(_frame);
+    final selected = <_FrameSegment, Bitset>{};
+    return DataFrameView._(_frame, [
+      for (final pointer in _rows)
+        if (selected.putIfAbsent(pointer.segment,
+            () => condition._evaluate(pointer.segment))[pointer.row])
+          pointer,
+    ]);
   }
 
   /// Materializes this view into independent typed Series chunks.
@@ -1073,7 +1004,7 @@ class DataFrameViewColumn extends IterableBase<Object?> {
 
   Object? operator [](int index) {
     final pointer = _view._rows[index];
-    return pointer.segment.columns[name]![pointer.row];
+    return pointer.segment.columns[name]!.valueAt(pointer.row);
   }
 
   @override
