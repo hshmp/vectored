@@ -26,7 +26,12 @@ class DataFrame {
   final Set<String> _uncacheableColumns;
   final Set<String> _nonNumericColumns;
   final bool _aggregateCaching;
-  List<({int chunk, int row})>? _visibleRows;
+
+  // rows stored in chunks, excluding the pending buffer
+  int _storedRows;
+
+  // live rows before each chunk; rebuilt lazily after edits
+  Int32List? _livePrefix;
 
   static int _nextRowId = 0;
 
@@ -39,8 +44,9 @@ class DataFrame {
     this._uncacheableColumns,
     this._nonNumericColumns,
     this._aggregateCaching,
-  ) : _deletedCount =
-            _deleted.values.fold(0, (total, rows) => total + rows.count);
+  )   : _deletedCount =
+            _deleted.values.fold(0, (total, rows) => total + rows.count),
+        _storedRows = _chunks.fold(0, (total, chunk) => total + chunk.length);
 
   /// Creates an empty frame with the named [columns].
   factory DataFrame.empty(
@@ -117,12 +123,7 @@ class DataFrame {
       false,
     );
     if (series.isNotEmpty) {
-      frame._chunks.add(
-        _FrameSegment(
-          _SeriesChunk({for (final column in series) column.name: column}),
-          _newSegmentId(),
-        ),
-      );
+      frame._addChunk({for (final column in series) column.name: column});
     }
     return frame;
   }
@@ -134,8 +135,7 @@ class DataFrame {
   List<String> get columns => _columns;
 
   /// The number of stored rows, including rows marked for deletion.
-  int get physicalLength =>
-      _chunks.fold(0, (total, chunk) => total + chunk.length) + _pendingLength;
+  int get physicalLength => _storedRows + _pendingLength;
 
   /// The number of stored chunks, including a pending append buffer.
   int get physicalChunkCount => _chunks.length + (_pendingLength == 0 ? 0 : 1);
@@ -183,7 +183,6 @@ class DataFrame {
       _pendingColumns[column]!.add(row[column]);
     }
     _pendingLength++;
-    _visibleRows = null;
     if (_pendingLength >= _chunkSize) {
       _flushPending();
     }
@@ -201,7 +200,7 @@ class DataFrame {
   /// Row data remains in its series chunk until [compact] is called.
   void deleteRow(int index) {
     _flushPending();
-    final location = _locationForDelete(index);
+    final location = _locationAt(index);
     final chunk = _chunks[location.chunk];
     (_deleted[chunk.id] ??= Bitset(chunk.length)).set(location.row);
     _deletedCount++;
@@ -215,7 +214,7 @@ class DataFrame {
         _numericStats[column] = _rebuildNumericStats(column);
       }
     }
-    _visibleRows = null;
+    _livePrefix = null;
   }
 
   /// Returns one flag per live row: set where [where] selects the row.
@@ -510,6 +509,7 @@ class DataFrame {
     _chunks
       ..clear()
       ..addAll(compacted._chunks);
+    _storedRows = compacted._storedRows;
     _deleted.clear();
     _deletedCount = 0;
     _numericStats
@@ -521,7 +521,7 @@ class DataFrame {
     _nonNumericColumns
       ..clear()
       ..addAll(compacted._nonNumericColumns);
-    _visibleRows = null;
+    _livePrefix = null;
   }
 
   /// Creates a frame from row-oriented [rows].
@@ -542,13 +542,13 @@ class DataFrame {
       for (final column in _columns)
         column: _seriesFromValues(column, _pendingColumns[column]!),
     };
-    _chunks.add(_FrameSegment(_SeriesChunk(series), _newSegmentId()));
+    _addChunk(series);
     _recordChunkStats(series);
     for (final values in _pendingColumns.values) {
       values.clear();
     }
     _pendingLength = 0;
-    _visibleRows = null;
+    _livePrefix = null;
   }
 
   /// Folds the stored values of a new chunk's [series] into the cached
@@ -599,48 +599,49 @@ class DataFrame {
           _columns[index]: values[index],
       };
 
-  List<({int chunk, int row})> _buildVisibleRows() {
-    final rows = <({int chunk, int row})>[];
-    for (var chunkIndex = 0; chunkIndex < _chunks.length; chunkIndex++) {
-      final chunk = _chunks[chunkIndex];
-      final deleted = _deleted[chunk.id];
-      for (var rowIndex = 0; rowIndex < chunk.length; rowIndex++) {
-        if (deleted == null || !deleted[rowIndex]) {
-          rows.add((chunk: chunkIndex, row: rowIndex));
-        }
-      }
-    }
-    _visibleRows = rows;
-    return rows;
+  void _addChunk(Map<String, Series<dynamic>> series) {
+    final segment = _FrameSegment(_SeriesChunk(series), _newSegmentId());
+    _chunks.add(segment);
+    _storedRows += segment.length;
+    _livePrefix = null;
   }
 
+  /// Returns the live rows before each chunk, with the total at the end.
+  ///
+  /// One entry per chunk instead of one per row, so rebuilding after an
+  /// edit is cheap.
+  Int32List _buildLivePrefix() {
+    final prefix = Int32List(_chunks.length + 1);
+    for (var i = 0; i < _chunks.length; i++) {
+      final chunk = _chunks[i];
+      prefix[i + 1] =
+          prefix[i] + chunk.length - (_deleted[chunk.id]?.count ?? 0);
+    }
+    return _livePrefix = prefix;
+  }
+
+  /// Finds the chunk and physical row of live row [index].
+  ///
+  /// Binary-searches the per-chunk live counts, then skips deleted rows
+  /// 32 at a time inside the chunk.
   ({int chunk, int row}) _locationAt(int index) {
     if (index < 0 || index >= length) {
       throw RangeError.index(index, this, 'index');
     }
-    return (_visibleRows ?? _buildVisibleRows())[index];
-  }
-
-  ({int chunk, int row}) _locationForDelete(int index) {
-    if (index < 0 || index >= length) {
-      throw RangeError.index(index, this, 'index');
-    }
-
-    var remaining = index;
-    for (var chunkIndex = 0; chunkIndex < _chunks.length; chunkIndex++) {
-      final chunk = _chunks[chunkIndex];
-      final deleted = _deleted[chunk.id];
-      final liveCount = chunk.length - (deleted?.count ?? 0);
-      if (remaining >= liveCount) {
-        remaining -= liveCount;
-        continue;
-      }
-      for (var row = 0; row < chunk.length; row++) {
-        if (deleted != null && deleted[row]) continue;
-        if (remaining-- == 0) return (chunk: chunkIndex, row: row);
+    final prefix = _livePrefix ?? _buildLivePrefix();
+    var low = 0;
+    var high = _chunks.length - 1;
+    while (low < high) {
+      final mid = (low + high + 1) >> 1;
+      if (prefix[mid] <= index) {
+        low = mid;
+      } else {
+        high = mid - 1;
       }
     }
-    throw StateError('Live row index could not be resolved');
+    final local = index - prefix[low];
+    final deleted = _deleted[_chunks[low].id];
+    return (chunk: low, row: deleted == null ? local : deleted.nthClear(local));
   }
 
   _NumericStats _numericStatsFor(String column) {
@@ -811,7 +812,7 @@ class DataFrame {
             _ => _seriesFromValues(column, data[column]!.sublist(start, end)),
           },
       };
-      frame._chunks.add(_FrameSegment(_SeriesChunk(series), _newSegmentId()));
+      frame._addChunk(series);
       if (numericStats == null) frame._recordChunkStats(series);
     }
     return frame;
@@ -859,11 +860,51 @@ class DataFrameColumn extends IterableBase<Object?> {
   Object? operator [](int index) => _frame._valueAt(name, index);
 
   @override
-  Iterator<Object?> get iterator => _iterate().iterator;
+  Iterator<Object?> get iterator {
+    _frame._flushPending();
+    return _ColumnIterator(_frame, name);
+  }
+}
 
-  Iterable<Object?> _iterate() sync* {
-    for (var index = 0; index < length; index++) {
-      yield this[index];
+/// Walks a column chunk by chunk, skipping deleted rows.
+///
+/// Reads each stored value directly instead of locating rows one at a time.
+final class _ColumnIterator implements Iterator<Object?> {
+  final List<_FrameSegment> _chunks;
+  final Map<int, Bitset> _deleted;
+  final String _name;
+  int _chunkIndex = -1;
+  int _row = 0;
+  Series<dynamic>? _series;
+  Bitset? _chunkDeleted;
+  Object? _current;
+
+  _ColumnIterator(DataFrame frame, this._name)
+      : _chunks = frame._chunks,
+        _deleted = frame._deleted;
+
+  @override
+  Object? get current => _current;
+
+  @override
+  bool moveNext() {
+    while (true) {
+      final series = _series;
+      if (series != null && _row < series.length) {
+        final row = _row++;
+        final deleted = _chunkDeleted;
+        if (deleted != null && deleted[row]) continue;
+        _current = series.valueAt(row);
+        return true;
+      }
+      if (++_chunkIndex >= _chunks.length) {
+        _current = null;
+        return false;
+      }
+      final chunk = _chunks[_chunkIndex];
+      _series = chunk.columns[_name];
+      _chunkDeleted = _deleted[chunk.id];
+      _row = 0;
     }
   }
 }

@@ -1,3 +1,5 @@
+import 'dart:math';
+
 import 'package:test/test.dart';
 import 'package:vectored/vectored.dart';
 
@@ -24,6 +26,21 @@ void main() {
       expect(Bitset.filled(33, true).count, equals(33));
     });
 
+    test('finds the nth cleared flag across words', () {
+      final bits = Bitset(100);
+      for (var i = 0; i < 100; i += 3) {
+        bits.set(i);
+      }
+      final cleared = [
+        for (var i = 0; i < 100; i++)
+          if (!bits[i]) i
+      ];
+      for (var n = 0; n < cleared.length; n++) {
+        expect(bits.nthClear(n), equals(cleared[n]));
+      }
+      expect(() => bits.nthClear(cleared.length), throwsRangeError);
+    });
+
     test('combines with and, or and andNot', () {
       final a = Bitset.fromBools([true, true, false, false]);
       final b = Bitset.fromBools([true, false, true, false]);
@@ -31,6 +48,33 @@ void main() {
       expect((a | b).toList(), equals([true, true, true, false]));
       expect(a.copy().andNot(b).toList(), equals([false, true, false, false]));
       expect(() => a.and(Bitset(3)), throwsArgumentError);
+    });
+  });
+
+  group('row lookup', () {
+    test('every read path agrees with a list under random edits', () {
+      final random = Random(7);
+      final reference = [for (var i = 0; i < 500; i++) i];
+      final frame = DataFrame.fromColumns({'v': reference}, chunkSize: 37);
+      for (var step = 0; step < 400; step++) {
+        if (random.nextInt(3) == 0) {
+          frame.appendRow({'v': 1000 + step});
+          reference.add(1000 + step);
+        } else {
+          final index = random.nextInt(reference.length);
+          frame.deleteRow(index);
+          reference.removeAt(index);
+        }
+      }
+
+      expect(frame.length, equals(reference.length));
+      expect(frame['v'].toList(), equals(reference));
+      for (var i = 0; i < reference.length; i += 7) {
+        expect(frame['v'][i], equals(reference[i]));
+        expect(frame.rowAt(i), equals({'v': reference[i]}));
+      }
+      frame.compact();
+      expect(frame['v'].toList(), equals(reference));
     });
   });
 

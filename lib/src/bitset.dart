@@ -129,6 +129,29 @@ final class Bitset {
     }
   }
 
+  /// Returns the index of the [n]th cleared flag, counting from zero.
+  ///
+  /// Skips whole words by popcount, so it costs one step per 32 flags.
+  int nthClear(int n) {
+    RangeError.checkValueInInterval(n, 0, length - count - 1, 'n');
+    var remaining = n;
+    for (var w = 0; w < _words.length; w++) {
+      final clear = ~_words[w] & 0xFFFFFFFF;
+      final available = _popCount(clear);
+      if (remaining >= available) {
+        remaining -= available;
+        continue;
+      }
+      var word = clear;
+      while (remaining > 0) {
+        word &= word - 1;
+        remaining--;
+      }
+      return (w << 5) + (word & -word).bitLength - 1;
+    }
+    throw StateError('Cleared flag $n not found');
+  }
+
   /// Returns the indices of set flags in ascending order.
   List<int> toIndices() {
     final result = <int>[];
