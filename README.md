@@ -1,84 +1,91 @@
-A sample command-line application with an entrypoint in `bin/`, library code
-in `lib/`, and example unit test in `test/`.
+# Vectored
 
-## DataFrame
+Fast data tables for Dart and Flutter. If you've used pandas, you already know
+most of it, and you don't need Python or a server to use it.
 
-`DataFrame` stores named `Series` objects in bounded column chunks. Use
-`DataFrame.fromSeries` to assemble existing float, int, and string series, or
-`DataFrame.fromColumns` to build the typed series from lists. Appends are
-buffered into chunks; concatenation links series chunks without copying values.
-Deletes are logical until `compact()` copies live values into fresh series.
-Column access returns a lazy view; calling `toList()` materializes it.
+## Why Vectored
+
+- **Fast:** filtering, searching and totals are much quicker than plain Dart
+  lists, and quicker than Pandas in early tests.
+- **Familiar:** `sum`, `mean`, `filter` and `concat` work the way they do in
+  Pandas.
+- **Built for live data:** add and remove rows freely, and totals update
+  instantly instead of being recalculated.
+- **Pure Dart:** runs anywhere Dart runs, including Flutter apps, with nothing
+  extra to install.
+
+## How it compares
+
+| | Vectored | Matrix2D | Pandas | Polars |
+|---|---|---|---|---|
+| Language | Dart | Dart | Python | Python / Rust |
+| Tables with named columns | ✅ | ❌ | ✅ | ✅ |
+| Text search and filtering | ✅ | ❌ | ✅ | ✅ |
+| Instant totals while editing | ✅ | ❌ | ❌ | ❌ |
+| Runs inside a Flutter app | ✅ | ✅ | ❌ | ❌ |
+| Group by, joins, CSV import | Planned | ❌ | ✅ | ✅ |
+
+Pick Vectored when your data lives in a Dart or Flutter app. For heavy
+analysis on a desktop or server, Polars is still the fastest option.
+
+## Getting started
 
 ```dart
-final left = DataFrame.fromColumns({
-  'id': [1, 2],
-  'name': ['ada', 'grace'],
+import 'package:vectored/vectored.dart';
+
+final people = DataFrame.fromColumns({
+  'age': [36, 45, 29],
+  'name': ['ada', 'grace', 'linus'],
+});
+```
+
+## Reading data
+
+```dart
+people['name'].toList(); // [ada, grace, linus]
+people.rowAt(0);         // {age: 36, name: ada}
+```
+
+## Adding and removing rows
+
+```dart
+people.appendRow({'age': 52, 'name': 'barbara'});
+people.deleteRow(1);
+```
+
+Call `people.compact()` now and then after lots of deletes to free up memory.
+
+## Totals and averages
+
+```dart
+people.sum('age');
+people.mean('age');
+people.min('age');
+people.max('age');
+```
+
+## Searching and filtering
+
+```dart
+people.filterContains('name', 'a');         // rows whose name contains "a"
+people.filterMatch('name', RegExp(r'^b'));  // rows whose name starts with "b"
+```
+
+Use `filterViewContains` instead when you only need to read the results. It
+skips copying, so it's faster.
+
+## Stacking tables
+
+```dart
+final newcomers = DataFrame.fromColumns({
+  'age': [41],
+  'name': ['edsger'],
 });
 
-left.appendRow({'id': 3, 'name': 'linus'});
-left.deleteRow(1);
-
-final matches = left.contains('name', 'lin');
-final filtered = left.filter(matches);
-final view = left.filterViewContains('name', 'lin');
-final total = left.sum('id');
-final names = left['name'].toList();
-final matchingIds = view['id'].toList();
-final materializedView = view.materialize();
-left.compact();
+final everyone = people.concat(newcomers); // same column names required
 ```
 
-`contains` delegates to the packed UTF-8 `StringSeries` matcher; `match` accepts
-a precompiled regular expression. Owned numeric columns maintain cached sum and
-count plus ordered value frequencies for min/max, so appends and deletes update
-aggregates without rescanning live rows. `mean`, `sum`, `count`, `min`, and
-`max` expose those numeric aggregates. Frames built with
-`fromSeries` remain uncached because their shared series can be mutated
-externally. `concat` returns a new frame and shares series chunks.
-Later appends or deletes on either input do not change the combined frame.
-`compact()` is explicit because it copies live values; use it when deleted rows
-or many small chunks consume too much memory. Compaction gathers columns
-directly and packs them into bounded chunks.
+## Good to know
 
-`filterContains` and `filterMatch` return independent, materialized frames.
-`filterViewContains` and `filterViewMatch` instead capture matching source-row
-pointers without building a mask or copying columns. Views keep their selected
-rows when the source is appended to, deleted from, or compacted; changes to
-externally shared Series values remain visible. Use `materialize()` when the
-view needs independent typed Series storage.
-
-Run the cross-library benchmark from PowerShell:
-
-```powershell
-.\benchmarks\run_benchmarks.ps1
-```
-
-It compiles Dart to AOT, runs Vectored and Matrix2D, then runs Pandas and Polars, checks result parity, and writes a wide comparison
-CSV with one row per operation and separate mean/stddev columns for each
-library and list baseline. The filter rows keep the two Vectored measurements
-separate so each can be compared with its corresponding list baseline. The
-original long-form records are saved alongside it with a `.raw.csv` suffix.
-Both files are written without a UTF-8 BOM.
-Install Python dependencies first with
-`python -m pip install -r benchmarks/requirements-python.txt`. Override the
-defaults with `-Rows 100000 -Trials 25 -Warmups 5 -Python C:\path\to\python.exe`.
-
-For a standalone Dart run, `dart run bin/benchmark.dart` runs the full suite;
-`dart run bin/benchmark.dart --dataframe-csv --rows=50000 --trials=15` emits
-only the DataFrame CSV.
-The Dart suite also benchmarks Matrix2D's numeric sum implementation through a
-benchmark-only compatibility copy of Matrix2D 1.0.4. Only the SDK constraint is
-relaxed; upstream source and its MIT license are retained. Matrix2D is an
-array-math package, not a DataFrame, so comparisons are limited to shared
-numeric reductions. Spark is intentionally a separate distributed benchmark:
-startup, partitioning, and cluster configuration make local in-process timings
-misleading.
-
-Materialized filtering scans the predicate and allocates a new result frame
-containing the selected rows. This differs from a mask-only query and from a
-lazy view; benchmark each workload separately. The Dart benchmark includes
-both a `List<Map>` baseline and a column-oriented list baseline for filtering.
-The `filter-view` row measures pointer selection only and does not include
-materializing the selected rows; do not compare it as a replacement for
-`filter-materialized`.
+Decimal numbers are stored with about 7 digits of precision to save memory and
+time. Very large whole numbers, such as timestamps, are kept exactly.
