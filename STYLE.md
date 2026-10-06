@@ -74,3 +74,18 @@ For single line `//` comments:
 ### Functions
 
 Only functions should have detailed sentences describing what they do. Use `///` [documentation comments](https://dart.dev/language/comments) before functions. Parameters and types are referenced like `[param]` in comments.
+
+## Commits
+
+Follow semantic commit messages and keep them short:
+
+```
+feat: create project
+fix: remove rogue scrollbars
+docs: add code examples
+```
+
+Each commit should:
+- have only 1 author
+- pass all tests
+- result in a functioning product
