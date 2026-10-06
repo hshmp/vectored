@@ -1,36 +1,37 @@
 # Vectored
 
-Fast data tables for Dart and Flutter. If you've used pandas, you already know
-most of it, and you don't need Python or a server to use it.
+**The data table that keeps up.** Add and delete rows whenever you like, and
+your totals, averages, minimums and maximums are already up to date. You never
+rebuild the table and never wait for a recount.
 
 ## Why Vectored
 
-- **Fast:** filtering, searching and totals are much quicker than plain Dart
-  lists, and quicker than Pandas in early tests.
-- **Familiar:** `sum`, `mean`, `filter`, `groupBy` and `concat` work the way
-  they do in Pandas.
-- **Easy to write:** filters are plain Dart, so your editor autocompletes
-  them and catches typos before you run anything.
-- **Built for live data:** add and remove rows freely, and totals update
-  instantly instead of being recalculated.
-- **Pure Dart:** runs anywhere Dart runs, including Flutter apps, with nothing
-  extra to install.
+- **Truly editable tables:** add and delete rows in place. Other data table
+  libraries rebuild the table on every change. Vectored just updates it.
+- **Answers that are always ready:** `sum`, `mean`, `min`, `max` and `count`
+  are kept current as you edit, so they come back instantly however big the
+  table grows.
+- **Zero-copy everything:** stacking two tables or viewing filtered rows
+  shares the existing data instead of duplicating it.
+- **Fast searches:** columns are packed tightly in memory, so filters and text
+  search run several times faster than looping over lists, and faster than
+  Pandas.
+- **Familiar and easy:** if you know Pandas, you know Vectored. Filters are
+  plain Dart, so your editor autocompletes them.
+- **Runs everywhere:** pure Dart, so the same code runs on servers,
+  command-line tools, desktop and mobile with nothing extra to install.
 
 ## How it compares
 
-| | Vectored | Matrix2D | Pandas | Polars |
+| | Vectored | Pandas | Polars | Matrix2D |
 |---|---|---|---|---|
-| Language | Dart | Dart | Python | Python / Rust |
-| Tables with named columns | ✅ | ❌ | ✅ | ✅ |
-| Text search and filtering | ✅ | ❌ | ✅ | ✅ |
-| Group by | ✅ | ❌ | ✅ | ✅ |
-| Missing values | ✅ | ❌ | ✅ | ✅ |
-| Instant totals while editing | ✅ | ❌ | ❌ | ❌ |
-| Runs inside a Flutter app | ✅ | ✅ | ❌ | ❌ |
-| Joins, CSV import | Planned | ❌ | ✅ | ✅ |
-
-Pick Vectored when your data lives in a Dart or Flutter app. For heavy
-analysis on a desktop or server, Polars is still the fastest option.
+| Add and delete rows without rebuilding | ✅ | ❌ | ❌ | ❌ |
+| Totals stay current as you edit | ✅ | ❌ | ❌ | ❌ |
+| Stack tables without copying | ✅ | ❌ | ✅ | ❌ |
+| Group by | ✅ | ✅ | ✅ | ❌ |
+| Text search and filtering | ✅ | ✅ | ✅ | ❌ |
+| Missing values | ✅ | ✅ | ✅ | ❌ |
+| Same code on server, desktop and mobile | ✅ | ❌ | ❌ | ✅ |
 
 ## Getting started
 
@@ -50,23 +51,25 @@ people['name'].toList(); // [ada, grace, linus]
 people.rowAt(0);         // {age: 36, name: ada}
 ```
 
-## Adding and removing rows
+## Live editing with instant totals
+
+This is what makes Vectored different. Edit the table in place, and every
+total is already correct the moment you ask for it.
 
 ```dart
 people.appendRow({'age': 52, 'name': 'barbara'});
-people.deleteRow(1);
+people.deleteRow(1); // grace leaves
+
+people.count('age'); // 3
+people.sum('age');   // 117
+people.mean('age');  // 39.0
+people.min('age');   // 29
+people.max('age');   // 52
 ```
 
-Call `people.compact()` now and then after lots of deletes to free up memory.
-
-## Totals and averages
-
-```dart
-people.sum('age');
-people.mean('age');
-people.min('age');
-people.max('age');
-```
+None of these calls scans the table. Vectored keeps the answers up to date on
+every edit, so they're just as fast with a million rows as with three. After
+lots of deletes, call `people.compact()` now and then to free up memory.
 
 ## Filtering
 
@@ -134,7 +137,11 @@ final newcomers = DataFrame.fromColumns({
 });
 
 final everyone = people.concat(newcomers); // same column names required
+everyone.sum('age'); // 158
 ```
+
+Stacking is instant: the new table shares the rows of both originals instead
+of copying them, and edits to one table never leak into another.
 
 ## Good to know
 
