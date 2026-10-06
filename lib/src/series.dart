@@ -48,10 +48,7 @@ class FloatSeries extends Series<double> {
   final FloatTensor tensor;
 
   FloatSeries(super.name, this.tensor, {super.index}) {
-    if (index != null) {
-      assert(index!.length == tensor.length,
-          'Index length must match data length');
-    }
+    _checkIndex(index, tensor.length);
   }
 
   @override
@@ -93,7 +90,6 @@ class FloatSeries extends Series<double> {
   ///
   /// The [other] series must have the same length as this series.
   FloatSeries add_(FloatSeries other) {
-    assert(length == other.length, 'Series length mismatch');
     tensor.add_(other.tensor);
     return this;
   }
@@ -102,7 +98,6 @@ class FloatSeries extends Series<double> {
   ///
   /// The [other] series must have the same length as this series.
   FloatSeries sub_(FloatSeries other) {
-    assert(length == other.length, 'Series length mismatch');
     tensor.sub_(other.tensor);
     return this;
   }
@@ -119,10 +114,7 @@ class IntSeries extends Series<int> {
   final IntTensor tensor;
 
   IntSeries(super.name, this.tensor, {super.index}) {
-    if (index != null) {
-      assert(index!.length == tensor.length,
-          'Index length must match data length');
-    }
+    _checkIndex(index, tensor.length);
   }
 
   @override
@@ -159,7 +151,6 @@ class IntSeries extends Series<int> {
   ///
   /// The [other] series must have the same length as this series.
   IntSeries add_(IntSeries other) {
-    assert(length == other.length, 'Series length mismatch');
     tensor.add_(other.tensor);
     return this;
   }
@@ -168,7 +159,6 @@ class IntSeries extends Series<int> {
   ///
   /// The [other] series must have the same length as this series.
   IntSeries sub_(IntSeries other) {
-    assert(length == other.length, 'Series length mismatch');
     tensor.sub_(other.tensor);
     return this;
   }
@@ -179,12 +169,7 @@ class StringSeries extends Series<String> {
   final TextSeries _text;
 
   StringSeries(super.name, List<String> data, {super.index})
-      : _text = TextSeries.fromStrings(name, data, index: index) {
-    if (index != null) {
-      assert(
-          index!.length == data.length, 'Index length must match data length');
-    }
-  }
+      : _text = TextSeries.fromStrings(name, data, index: index);
 
   StringSeries._(super.name, this._text);
 
@@ -222,10 +207,7 @@ class ObjectSeries extends Series<Object?> {
 
   ObjectSeries(super.name, List<Object?> data, {super.index})
       : _data = List<Object?>.unmodifiable(data) {
-    if (index != null) {
-      assert(
-          index!.length == data.length, 'Index length must match data length');
-    }
+    _checkIndex(index, data.length);
   }
 
   /// Copies selected values into a new object series.
@@ -240,4 +222,11 @@ class ObjectSeries extends Series<Object?> {
 
   /// Returns the immutable values in this series.
   List<Object?> get data => _data;
+}
+
+void _checkIndex(List<Object>? index, int length) {
+  if (index != null && index.length != length) {
+    throw ArgumentError.value(
+        index.length, 'index', 'Index length must match data length');
+  }
 }

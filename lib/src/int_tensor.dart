@@ -7,14 +7,16 @@ class IntTensor {
   final List<int> _shape;
   final List<int> _strides;
   final int _offset;
+  final int _length;
   int _runningSum = 0;
   final bool _tracked;
 
   IntTensor._(this._data, this._shape, this._strides, this._offset,
       {bool tracked = false})
-      : _tracked = tracked {
+      : _length = _shape.fold(1, (acc, dim) => acc * dim),
+        _tracked = tracked {
     if (_tracked) {
-      _runningSum = SimdOps.sumInt(_data);
+      _runningSum = SimdOps.sumIntOffset(_data, _offset, _length);
     }
   }
 
@@ -34,7 +36,7 @@ class IntTensor {
     );
   }
 
-  int get length => _shape.fold(1, (acc, dim) => acc * dim);
+  int get length => _length;
   int get count => length;
   List<int> get shape => _shape;
   List<int> get strides => _strides;
@@ -81,9 +83,7 @@ class IntTensor {
   /// Returns a zero-copy view over the window from [start] to [end].
   IntTensor slice(int start, [int? end]) {
     final actualEnd = end ?? length;
-    assert(start >= 0 && start <= length, 'Start out of bounds: $start');
-    assert(actualEnd >= start && actualEnd <= length,
-        'End out of bounds: $actualEnd');
+    RangeError.checkValidRange(start, actualEnd, length);
 
     final sliceLen = actualEnd - start;
     return IntTensor._(_data, [sliceLen], [1], _offset + start, tracked: false);
@@ -91,57 +91,59 @@ class IntTensor {
 
   /// Adds [other] into this tensor in-place and returns the mutated tensor.
   IntTensor add_(IntTensor other) {
-    assert(length == other.length, 'Size mismatch');
-    if (_offset == 0 && other._offset == 0) {
-      SimdOps.addInt(_data, other._data, _data);
-    } else {
-      SimdOps.addIntOffset(
-          _data, _offset, other._data, other._offset, _data, _offset, length);
-    }
-    if (_tracked) _runningSum = SimdOps.sumInt(_data);
+    _requireSameLength(other);
+    SimdOps.addIntOffset(
+        _data, _offset, other._data, other._offset, _data, _offset, _length);
+    if (_tracked) _runningSum = SimdOps.sumIntOffset(_data, _offset, _length);
     return this;
   }
 
   /// Subtracts [other] from this tensor in-place and returns the mutated tensor.
   IntTensor sub_(IntTensor other) {
-    assert(length == other.length, 'Size mismatch');
-    SimdOps.subInt(_data, other._data, _data);
-    if (_tracked) _runningSum = SimdOps.sumInt(_data);
+    _requireSameLength(other);
+    SimdOps.subIntOffset(
+        _data, _offset, other._data, other._offset, _data, _offset, _length);
+    if (_tracked) _runningSum = SimdOps.sumIntOffset(_data, _offset, _length);
     return this;
   }
 
   /// Returns a new tensor containing the element-wise sum of this tensor and [other].
   IntTensor operator +(IntTensor other) {
-    assert(length == other.length, 'Size mismatch');
-    final out = IntTensor.vector(length);
-    if (_offset == 0 && other._offset == 0) {
-      SimdOps.addInt(_data, other._data, out._data);
-    } else {
-      SimdOps.addIntOffset(
-          _data, _offset, other._data, other._offset, out._data, 0, length);
-    }
+    _requireSameLength(other);
+    final out = IntTensor.vector(_length);
+    SimdOps.addIntOffset(
+        _data, _offset, other._data, other._offset, out._data, 0, _length);
     return out;
   }
 
   /// Returns a new tensor containing the element-wise difference of this tensor and [other].
   IntTensor operator -(IntTensor other) {
-    assert(length == other.length, 'Size mismatch');
-    final out = IntTensor.vector(length);
-    SimdOps.subInt(_data, other._data, out._data);
+    _requireSameLength(other);
+    final out = IntTensor.vector(_length);
+    SimdOps.subIntOffset(
+        _data, _offset, other._data, other._offset, out._data, 0, _length);
     return out;
   }
 
   /// Returns a new tensor containing the element-wise product of this tensor and [other].
   IntTensor operator *(IntTensor other) {
-    assert(length == other.length, 'Size mismatch');
-    final out = IntTensor.vector(length);
-    SimdOps.mulInt(_data, other._data, out._data);
+    _requireSameLength(other);
+    final out = IntTensor.vector(_length);
+    SimdOps.mulIntOffset(
+        _data, _offset, other._data, other._offset, out._data, 0, _length);
     return out;
   }
 
   /// Returns the sum of all values in this tensor.
-  int sum() => _tracked ? _runningSum : SimdOps.sumInt(_data);
+  int sum() =>
+      _tracked ? _runningSum : SimdOps.sumIntOffset(_data, _offset, _length);
 
   /// Returns the arithmetic mean of all values in this tensor.
   double mean() => count == 0 ? 0.0 : sum() / count;
+
+  void _requireSameLength(IntTensor other) {
+    if (_length != other._length) {
+      throw ArgumentError.value(other._length, 'other', 'Size mismatch');
+    }
+  }
 }

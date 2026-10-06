@@ -7,8 +7,10 @@ class FloatTensor {
   final List<int> _shape;
   final List<int> _strides;
   final int _offset;
+  final int _length;
 
-  FloatTensor._(this._data, this._shape, this._strides, this._offset);
+  FloatTensor._(this._data, this._shape, this._strides, this._offset)
+      : _length = _shape.fold(1, (acc, dim) => acc * dim);
 
   /// Creates a vector tensor with [length] elements initialized to zero.
   factory FloatTensor.vector(int length) {
@@ -30,7 +32,9 @@ class FloatTensor {
 
   /// Creates a tensor whose values vary evenly from [start] to [stop].
   factory FloatTensor.linspace(double start, double stop, int count) {
-    assert(count > 1, 'Count must be at least 2');
+    if (count < 2) {
+      throw ArgumentError.value(count, 'count', 'Must be at least 2');
+    }
     final tensor = FloatTensor.vector(count);
     final step = (stop - start) / (count - 1);
     for (int i = 0; i < count; i++) {
@@ -41,7 +45,9 @@ class FloatTensor {
 
   /// Creates a tensor whose values begin at [start] and step by [step].
   factory FloatTensor.arange(double start, double stop, [double step = 1.0]) {
-    assert(step > 0, 'Step must be positive');
+    if (step <= 0) {
+      throw ArgumentError.value(step, 'step', 'Must be positive');
+    }
     final int count = ((stop - start) / step).ceil();
     final tensor = FloatTensor.vector(count);
     for (int i = 0; i < count; i++) {
@@ -58,7 +64,7 @@ class FloatTensor {
     return List.unmodifiable(strides);
   }
 
-  int get length => _shape.fold(1, (acc, dim) => acc * dim);
+  int get length => _length;
   int get count => length;
   List<int> get shape => _shape;
   List<int> get strides => _strides;
@@ -97,9 +103,7 @@ class FloatTensor {
   /// Returns a zero-copy view over the window from [start] to [end].
   FloatTensor slice(int start, [int? end]) {
     final actualEnd = end ?? length;
-    assert(start >= 0 && start <= length, 'Start out of bounds: $start');
-    assert(actualEnd >= start && actualEnd <= length,
-        'End out of bounds: $actualEnd');
+    RangeError.checkValidRange(start, actualEnd, length);
 
     final sliceLen = actualEnd - start;
     return FloatTensor._(_data, [sliceLen], [1], _offset + start);
@@ -107,61 +111,55 @@ class FloatTensor {
 
   /// Adds [other] into this tensor in-place and returns the mutated tensor.
   FloatTensor add_(FloatTensor other) {
-    assert(length == other.length, 'Size mismatch');
-    if (_offset == 0 && other._offset == 0) {
-      SimdOps.addFloat(_data, other._data, _data); // fast path
-    } else {
-      SimdOps.addFloatOffset(_data, _offset, other._data, other._offset, _data,
-          _offset, length); // peeled path
-    }
+    _requireSameLength(other);
+    SimdOps.addFloatOffset(
+        _data, _offset, other._data, other._offset, _data, _offset, _length);
     return this;
   }
 
   /// Subtracts [other] from this tensor in-place and returns the mutated tensor.
   FloatTensor sub_(FloatTensor other) {
-    assert(length == other.length, 'Size mismatch');
-    SimdOps.subFloat(_data, other._data, _data);
+    _requireSameLength(other);
+    SimdOps.subFloatOffset(
+        _data, _offset, other._data, other._offset, _data, _offset, _length);
     return this;
   }
 
   /// Scales this tensor in-place by [scalar] and returns the mutated tensor.
   FloatTensor scale_(double scalar) {
-    SimdOps.scaleFloat(_data, scalar, _data);
+    SimdOps.scaleFloatOffset(_data, _offset, scalar, _data, _offset, _length);
     return this;
   }
 
   /// Returns a new tensor containing the element-wise sum of this tensor and [other].
   FloatTensor operator +(FloatTensor other) {
-    assert(length == other.length, 'Size mismatch');
+    _requireSameLength(other);
     final out = FloatTensor.zeros(_shape);
-    if (_offset == 0 && other._offset == 0) {
-      SimdOps.addFloat(_data, other._data, out._data);
-    } else {
-      SimdOps.addFloatOffset(
-          _data, _offset, other._data, other._offset, out._data, 0, length);
-    }
+    SimdOps.addFloatOffset(
+        _data, _offset, other._data, other._offset, out._data, 0, _length);
     return out;
   }
 
   /// Returns a new tensor containing the element-wise difference of this tensor and [other].
   FloatTensor operator -(FloatTensor other) {
-    assert(length == other.length, 'Size mismatch');
+    _requireSameLength(other);
     final out = FloatTensor.zeros(_shape);
-    SimdOps.subFloat(_data, other._data, out._data);
+    SimdOps.subFloatOffset(
+        _data, _offset, other._data, other._offset, out._data, 0, _length);
     return out;
   }
 
   /// Returns a new tensor containing the element-wise product of this tensor and [other].
-  FloatTensor operator *(dynamic other) {
+  ///
+  /// [other] may be a [double] scalar or a [FloatTensor] of equal length.
+  FloatTensor operator *(Object other) {
     final out = FloatTensor.zeros(_shape);
     if (other is double) {
-      SimdOps.scaleFloat(_data, other, out._data);
+      SimdOps.scaleFloatOffset(_data, _offset, other, out._data, 0, _length);
     } else if (other is FloatTensor) {
-      assert(length == other.length, 'Size mismatch');
-      // elem-wise
-      for (int i = 0; i < length; i++) {
-        out[i] = this[i] * other[i];
-      }
+      _requireSameLength(other);
+      SimdOps.mulFloatOffset(
+          _data, _offset, other._data, other._offset, out._data, 0, _length);
     } else {
       throw ArgumentError('Unsupported operand: ${other.runtimeType}');
     }
@@ -169,11 +167,7 @@ class FloatTensor {
   }
 
   /// Returns the sum of all values in this tensor.
-  double sum() {
-    return _offset == 0
-        ? SimdOps.sumFloat(_data)
-        : SimdOps.sumFloatOffset(_data, _offset, length);
-  }
+  double sum() => SimdOps.sumFloatOffset(_data, _offset, _length);
 
   /// Returns the arithmetic mean of all values in this tensor.
   double mean() {
@@ -201,5 +195,12 @@ class FloatTensor {
   }
 
   /// Returns the minimum and maximum values in this tensor as a tuple.
-  (double min, double max) get bounds => SimdOps.minMaxFloat(_data);
+  (double min, double max) get bounds =>
+      SimdOps.minMaxFloatOffset(_data, _offset, _length);
+
+  void _requireSameLength(FloatTensor other) {
+    if (_length != other._length) {
+      throw ArgumentError.value(other._length, 'other', 'Size mismatch');
+    }
+  }
 }

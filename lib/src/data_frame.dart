@@ -172,21 +172,10 @@ class DataFrame {
   /// Appends [row] to the pending tail buffer.
   ///
   /// [row] must provide every declared column and no others. Values are
-  /// converted to series when the buffer reaches [chunkSize] or is read.
+  /// converted to series when the buffer reaches [chunkSize] or is read;
+  /// cached aggregates are updated from the stored values at that point.
   void appendRow(Map<String, Object?> row) {
     _validateRow(row);
-    if (_aggregateCaching) {
-      for (final column in _columns) {
-        final value = row[column];
-        final numericValue = _cacheableNumber(value);
-        if (numericValue != null && !_uncacheableColumns.contains(column)) {
-          (_numericStats[column] ??= _NumericStats()).add(numericValue);
-        } else {
-          _uncacheableColumns.add(column);
-          _numericStats.remove(column);
-        }
-      }
-    }
     for (final column in _columns) {
       _pendingColumns[column]!.add(row[column]);
     }
@@ -219,15 +208,12 @@ class DataFrame {
     );
     for (final column in _columns) {
       final value = chunk.columns[column]![location.row];
-      if (value is num) {
-        final stats = _numericStats[column];
-        if (stats == null) continue;
-        final rebuildExtrema = !stats.tracksFrequencies &&
-            (value == stats.minimum || value == stats.maximum);
-        stats.remove(value);
-        if (rebuildExtrema) {
-          _numericStats[column] = _rebuildNumericStats(column);
-        }
+      final stats = _numericStats[column];
+      if (value is! num || stats == null) continue;
+
+      // extrema lost; row already marked deleted
+      if (!stats.remove(value)) {
+        _numericStats[column] = _rebuildNumericStats(column);
       }
     }
     _visibleRows = null;
@@ -235,50 +221,69 @@ class DataFrame {
 
   /// Returns a mask of live rows whose string [column] contains [pattern].
   ///
-  /// Uses [StringSeries.contains] on each chunk and omits deleted rows.
-  IntTensor contains(String column, String pattern) {
+  /// Uses the packed [StringSeries] matcher on each chunk and omits deleted
+  /// rows. Null values never match.
+  IntTensor contains(String column, String pattern) => _stringMask(
+        column,
+        (values) => values.containingIndices(pattern),
+        (text) => text.contains(pattern),
+      );
+
+  /// Returns a mask of live rows matching [pattern] in [column].
+  ///
+  /// Null values never match.
+  IntTensor match(String column, RegExp pattern) => _stringMask(
+        column,
+        (values) => values.matchingIndices(pattern),
+        pattern.hasMatch,
+      );
+
+  IntTensor _stringMask(
+    String column,
+    List<int> Function(StringSeries) matcher,
+    bool Function(String) rowTest,
+  ) {
     _requireColumn(column);
     _flushPending();
     final output = IntTensor.vector(length);
     var logicalRow = 0;
 
     for (final chunk in _chunks) {
-      final values = chunk.columns[column];
-      if (values is! StringSeries) {
-        throw ArgumentError.value(
-            column, 'column', 'Column is not a string series');
-      }
-      final chunkMask = values.contains(pattern);
+      final hits = _matchingRows(chunk, column, matcher, rowTest);
+      var next = 0;
       for (var row = 0; row < chunk.length; row++) {
-        if (!_deletedRows.contains((segment: chunk.id, row: row))) {
-          output[logicalRow++] = chunkMask[row];
+        if (_deletedRows.contains((segment: chunk.id, row: row))) continue;
+        while (next < hits.length && hits[next] < row) {
+          next++;
         }
+        if (next < hits.length && hits[next] == row) output[logicalRow] = 1;
+        logicalRow++;
       }
     }
     return output;
   }
 
-  /// Returns a mask of live rows matching [pattern] in [column].
-  IntTensor match(String column, RegExp pattern) {
-    _requireColumn(column);
-    _flushPending();
-    final output = IntTensor.vector(length);
-    var logicalRow = 0;
-
-    for (final chunk in _chunks) {
-      final values = chunk.columns[column];
-      if (values is! StringSeries) {
-        throw ArgumentError.value(
-            column, 'column', 'Column is not a string series');
-      }
-      final chunkMask = values.match(pattern);
-      for (var row = 0; row < chunk.length; row++) {
-        if (!_deletedRows.contains((segment: chunk.id, row: row))) {
-          output[logicalRow++] = chunkMask[row];
-        }
-      }
+  /// Returns the ascending rows of [chunk] whose string [column] matches.
+  ///
+  /// Packed string chunks use [matcher]; chunks holding strings and nulls
+  /// (stored as [ObjectSeries]) test each string with [rowTest].
+  static List<int> _matchingRows(
+    _FrameSegment chunk,
+    String column,
+    List<int> Function(StringSeries) matcher,
+    bool Function(String) rowTest,
+  ) {
+    final values = chunk.columns[column];
+    if (values is StringSeries) return matcher(values);
+    if (values is ObjectSeries &&
+        values.data.every((value) => value == null || value is String)) {
+      return [
+        for (var row = 0; row < values.length; row++)
+          if (values[row] case final String text when rowTest(text)) row,
+      ];
     }
-    return output;
+    throw ArgumentError.value(
+        column, 'column', 'Column is not a string series');
   }
 
   /// Returns a new frame containing rows selected by [mask].
@@ -304,54 +309,47 @@ class DataFrame {
   }
 
   /// Returns a new frame containing rows where [column] contains [pattern].
-  DataFrame filterContains(String column, String pattern) =>
-      _filterString(column, (values) => values.containingIndices(pattern));
+  DataFrame filterContains(String column, String pattern) => _filterString(
+        column,
+        (values) => values.containingIndices(pattern),
+        (text) => text.contains(pattern),
+      );
 
   /// Returns a new frame containing rows where [pattern] matches [column].
-  DataFrame filterMatch(String column, RegExp pattern) =>
-      _filterString(column, (values) => values.matchingIndices(pattern));
+  DataFrame filterMatch(String column, RegExp pattern) => _filterString(
+        column,
+        (values) => values.matchingIndices(pattern),
+        pattern.hasMatch,
+      );
 
   /// Returns a snapshot view of rows whose [column] contains [pattern].
   ///
   /// The view stores source segment and row indices; it does not materialize
   /// columns or allocate a row mask.
-  DataFrameView filterViewContains(String column, String pattern) {
-    _requireColumn(column);
-    _flushPending();
-    final rows = <_RowPointer>[];
-    for (final chunk in _chunks) {
-      final values = chunk.columns[column];
-      if (values is! StringSeries) {
-        throw ArgumentError.value(
-          column,
-          'column',
-          'Column is not a string series',
-        );
-      }
-      for (final row in values.containingIndices(pattern)) {
-        if (!_deletedRows.contains((segment: chunk.id, row: row))) {
-          rows.add(_RowPointer(chunk, row));
-        }
-      }
-    }
-    return DataFrameView._(this, rows);
-  }
+  DataFrameView filterViewContains(String column, String pattern) =>
+      _filterView(
+        column,
+        (values) => values.containingIndices(pattern),
+        (text) => text.contains(pattern),
+      );
 
   /// Returns a snapshot view of rows matching [pattern] in [column].
-  DataFrameView filterViewMatch(String column, RegExp pattern) {
+  DataFrameView filterViewMatch(String column, RegExp pattern) => _filterView(
+        column,
+        (values) => values.matchingIndices(pattern),
+        pattern.hasMatch,
+      );
+
+  DataFrameView _filterView(
+    String column,
+    List<int> Function(StringSeries) matcher,
+    bool Function(String) rowTest,
+  ) {
     _requireColumn(column);
     _flushPending();
     final rows = <_RowPointer>[];
     for (final chunk in _chunks) {
-      final values = chunk.columns[column];
-      if (values is! StringSeries) {
-        throw ArgumentError.value(
-          column,
-          'column',
-          'Column is not a string series',
-        );
-      }
-      for (final row in values.matchingIndices(pattern)) {
+      for (final row in _matchingRows(chunk, column, matcher, rowTest)) {
         if (!_deletedRows.contains((segment: chunk.id, row: row))) {
           rows.add(_RowPointer(chunk, row));
         }
@@ -363,21 +361,14 @@ class DataFrame {
   DataFrame _filterString(
     String column,
     List<int> Function(StringSeries) matcher,
+    bool Function(String) rowTest,
   ) {
     _requireColumn(column);
     _flushPending();
     final selectedChunks = <_FrameSegment>[];
     for (final chunk in _chunks) {
-      final values = chunk.columns[column];
-      if (values is! StringSeries) {
-        throw ArgumentError.value(
-          column,
-          'column',
-          'Column is not a string series',
-        );
-      }
       final selectedRows = <int>[];
-      for (final row in matcher(values)) {
+      for (final row in _matchingRows(chunk, column, matcher, rowTest)) {
         if (!_deletedRows.contains((segment: chunk.id, row: row))) {
           selectedRows.add(row);
         }
@@ -409,27 +400,26 @@ class DataFrame {
     final uncacheable = <String>{};
     final nonNumeric = <String>{};
     for (final column in _columns) {
-      final first = _chunks.isNotEmpty
-          ? _chunks.first.columns[column]
-          : (chunks.isEmpty ? null : chunks.first.columns[column]);
-      if (first is IntSeries || first is FloatSeries) {
-        final columnStats = _NumericStats(trackFrequencies: false);
-        for (final chunk in chunks) {
-          final values = chunk.columns[column]!;
-          if (values is IntSeries) {
-            for (var row = 0; row < values.length; row++) {
-              columnStats.add(values[row]);
-            }
-          } else if (values is FloatSeries) {
-            for (var row = 0; row < values.length; row++) {
-              columnStats.add(values[row]);
-            }
-          }
-        }
-        stats[column] = columnStats;
-      } else if (first != null) {
+      // no selected rows; fall back to the source column's type
+      final numeric = chunks.isEmpty
+          ? !_nonNumericColumns.contains(column) &&
+              (_chunks.isEmpty ||
+                  _isNumericSeries(_chunks.first.columns[column]!))
+          : chunks.every((chunk) => _isNumericSeries(chunk.columns[column]!));
+      if (!numeric) {
         uncacheable.add(column);
         nonNumeric.add(column);
+        continue;
+      }
+
+      final columnStats = _NumericStats(trackFrequencies: false);
+      final cacheable = chunks.every(
+        (chunk) => _addSeriesToStats(columnStats, chunk.columns[column]!),
+      );
+      if (cacheable) {
+        stats[column] = columnStats;
+      } else {
+        uncacheable.add(column);
       }
     }
     return DataFrame._(
@@ -476,14 +466,16 @@ class DataFrame {
         total += values.sum();
       } else if (!hasDeletedRows && values is FloatSeries) {
         total += values.sum();
-      } else if (values is IntSeries || values is FloatSeries) {
-        for (var row = 0; row < chunk.length; row++) {
-          if (!_deletedRows.contains((segment: chunk.id, row: row))) {
-            total += values[row] as num;
-          }
-        }
       } else {
-        throw ArgumentError.value(column, 'column', 'Column is not numeric');
+        for (var row = 0; row < chunk.length; row++) {
+          if (_deletedRows.contains((segment: chunk.id, row: row))) continue;
+          final value = values[row];
+          if (value is! num) {
+            throw ArgumentError.value(
+                column, 'column', 'Column is not numeric');
+          }
+          total += value;
+        }
       }
     }
     return total;
@@ -621,11 +613,52 @@ class DataFrame {
         column: _seriesFromValues(column, _pendingColumns[column]!),
     };
     _chunks.add(_FrameSegment(_SeriesChunk(series), _newSegmentId()));
+    _recordChunkStats(series);
     for (final values in _pendingColumns.values) {
       values.clear();
     }
     _pendingLength = 0;
     _visibleRows = null;
+  }
+
+  /// Folds the stored values of a new chunk's [series] into the cached
+  /// aggregates, marking columns uncacheable or non-numeric as needed.
+  void _recordChunkStats(Map<String, Series<dynamic>> series) {
+    for (final column in _columns) {
+      final values = series[column]!;
+      if (!_isNumericSeries(values)) {
+        _nonNumericColumns.add(column);
+        _uncacheableColumns.add(column);
+        _numericStats.remove(column);
+        continue;
+      }
+      if (!_aggregateCaching || _uncacheableColumns.contains(column)) continue;
+
+      final stats = _numericStats[column] ??= _NumericStats();
+      if (!_addSeriesToStats(stats, values)) {
+        _uncacheableColumns.add(column);
+        _numericStats.remove(column);
+      }
+    }
+  }
+
+  /// Returns whether every value in [series] is a number.
+  static bool _isNumericSeries(Series<dynamic> series) => switch (series) {
+        IntSeries() || FloatSeries() => true,
+        ObjectSeries(:final data) => data.every((value) => value is num),
+        StringSeries() => false,
+      };
+
+  /// Adds every stored value of numeric [series] to [stats].
+  ///
+  /// Returns false when a value is not finite and cannot be cached.
+  static bool _addSeriesToStats(_NumericStats stats, Series<dynamic> series) {
+    for (var row = 0; row < series.length; row++) {
+      final value = _cacheableNumber(series[row]);
+      if (value == null) return false;
+      stats.add(value);
+    }
+    return true;
   }
 
   Map<String, List<Object?>> _columnsToMap(List<List<Object?>> values) => {
@@ -686,13 +719,13 @@ class DataFrame {
     final stats = _NumericStats();
     for (final chunk in _chunks) {
       final values = chunk.columns[column]!;
-      if (values is! IntSeries && values is! FloatSeries) {
-        throw ArgumentError.value(column, 'column', 'Column is not numeric');
-      }
       for (var row = 0; row < chunk.length; row++) {
-        if (!_deletedRows.contains((segment: chunk.id, row: row))) {
-          stats.add(values[row] as num);
+        if (_deletedRows.contains((segment: chunk.id, row: row))) continue;
+        final value = values[row];
+        if (value is! num) {
+          throw ArgumentError.value(column, 'column', 'Column is not numeric');
         }
+        stats.add(value);
       }
     }
     return stats;
@@ -763,11 +796,22 @@ class DataFrame {
     return (newSegments, deletes, deleteCounts);
   }
 
+  /// Picks the most compact series type that stores [values] without
+  /// silently changing them.
+  ///
+  /// Ints outside int32 range, or ints too large for float32 in a mixed
+  /// numeric column, fall back to an exact [ObjectSeries].
   static Series<dynamic> _seriesFromValues(String name, List<Object?> values) {
     if (values.every((value) => value is int)) {
-      return Series.fromInts(name, values.cast<int>());
+      if (values.every((value) => _fitsInt32(value as int))) {
+        return Series.fromInts(name, values.cast<int>());
+      }
+      return Series.fromObjects(name, values);
     }
     if (values.every((value) => value is num)) {
+      if (values.any((value) => value is int && !_fitsFloat32(value))) {
+        return Series.fromObjects(name, values);
+      }
       return Series.fromFloats(
         name,
         values.map((value) => (value as num).toDouble()).toList(),
@@ -789,19 +833,15 @@ class DataFrame {
   }) {
     final frame = DataFrame.empty(columns, chunkSize: chunkSize);
     if (numericStats == null) {
+      // empty columns; element type is the only hint
       for (final column in columns) {
         final values = data[column]!;
-        if (values.every((value) => _cacheableNumber(value) != null)) {
-          final stats = _NumericStats();
-          for (final value in values) {
-            stats.add(_cacheableNumber(value)!);
-          }
-          frame._numericStats[column] = stats;
-        } else {
+        if (values.isNotEmpty) continue;
+        if (values is List<num>) {
+          frame._numericStats[column] = _NumericStats();
+        } else if (values is List<String>) {
+          frame._nonNumericColumns.add(column);
           frame._uncacheableColumns.add(column);
-          if (values.any((value) => value is! num)) {
-            frame._nonNumericColumns.add(column);
-          }
         }
       }
     } else {
@@ -837,9 +877,16 @@ class DataFrame {
           },
       };
       frame._chunks.add(_FrameSegment(_SeriesChunk(series), _newSegmentId()));
+      if (numericStats == null) frame._recordChunkStats(series);
     }
     return frame;
   }
+
+  static bool _fitsInt32(int value) =>
+      value >= -0x80000000 && value <= 0x7fffffff;
+
+  // float32 mantissa holds ints exactly up to 2^24
+  static bool _fitsFloat32(int value) => value.abs() <= 0x1000000;
 
   static num? _cacheableNumber(Object? value) {
     if (value is int) return value;
@@ -964,19 +1011,21 @@ class DataFrameView extends IterableBase<Map<String, Object?>> {
   }
 
   /// Filters this view without materializing columns or a mask.
+  ///
+  /// Null values never match.
   DataFrameView filterContains(String column, String pattern) {
     _frame._requireColumn(column);
     final selected = <_RowPointer>[];
     for (final pointer in _rows) {
-      final values = pointer.segment.columns[column];
-      if (values is! StringSeries) {
+      final value = pointer.segment.columns[column]![pointer.row];
+      if (value != null && value is! String) {
         throw ArgumentError.value(
           column,
           'column',
           'Column is not a string series',
         );
       }
-      if (values[pointer.row].contains(pattern)) selected.add(pointer);
+      if (value?.contains(pattern) ?? false) selected.add(pointer);
     }
     return DataFrameView._(_frame, selected);
   }
@@ -1066,11 +1115,16 @@ final class _NumericStats {
     }
   }
 
-  void remove(num value) {
+  /// Removes [value] and returns whether [minimum] and [maximum] are still
+  /// exact; callers rebuild the stats from live rows when this is false.
+  bool remove(num value) {
     sum -= value;
     count--;
-    if (!_tracksFrequencies) return;
-    final frequency = _frequencies[value]!;
+    if (!_tracksFrequencies) {
+      return value != _minimum && value != _maximum;
+    }
+    final frequency = _frequencies[value];
+    if (frequency == null) return false;
     if (frequency == 1) {
       _frequencies.remove(value);
       if (_frequencies.isEmpty) {
@@ -1083,6 +1137,7 @@ final class _NumericStats {
     } else {
       _frequencies[value] = frequency - 1;
     }
+    return true;
   }
 
   _NumericStats copy() {

@@ -109,9 +109,9 @@ void main() {
 
     test('Slice bounds checking', () {
       final t = FloatTensor.vector(10);
-      expect(() => t.slice(-1, 5), throwsA(isA<AssertionError>()));
-      expect(() => t.slice(3, 11), throwsA(isA<AssertionError>()));
-      expect(() => t.slice(5, 2), throwsA(isA<AssertionError>()));
+      expect(() => t.slice(-1, 5), throwsRangeError);
+      expect(() => t.slice(3, 11), throwsRangeError);
+      expect(() => t.slice(5, 2), throwsRangeError);
     });
 
     test('Loop-peeled SIMD execution on unaligned slice [1:15]', () {
@@ -200,9 +200,9 @@ void main() {
 
     test('Slice bounds checking', () {
       final t = IntTensor.vector(10);
-      expect(() => t.slice(-1, 5), throwsA(isA<AssertionError>()));
-      expect(() => t.slice(3, 11), throwsA(isA<AssertionError>()));
-      expect(() => t.slice(5, 2), throwsA(isA<AssertionError>()));
+      expect(() => t.slice(-1, 5), throwsRangeError);
+      expect(() => t.slice(3, 11), throwsRangeError);
+      expect(() => t.slice(5, 2), throwsRangeError);
     });
 
     test('Loop-peeled SIMD execution on unaligned slice [1:15]', () {
@@ -229,7 +229,7 @@ void main() {
       expect(untracked.sum(), equals(40));
       expect(untracked.mean(), equals(10.0));
 
- // tracked; o(1)delta
+      // tracked; o(1)delta
       final tracked = IntTensor.fromList([5, 10, 15], tracked: true);
       expect(tracked.sum(), equals(30));
       expect(tracked.mean(), equals(10.0));

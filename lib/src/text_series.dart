@@ -19,8 +19,8 @@ class TextSeries {
     List<String> strings, {
     List<Object>? index,
   }) {
-    if (index != null) {
-      assert(index.length == strings.length, 'Index length mismatch');
+    if (index != null && index.length != strings.length) {
+      throw ArgumentError.value(index.length, 'index', 'Index length mismatch');
     }
 
     final int rowCount = strings.length;
